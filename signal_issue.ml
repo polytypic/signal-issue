@@ -646,36 +646,6 @@ module Picos_htbl = struct
     | B (Resize _) -> remove_node t key Backoff.default
 
   let try_remove t key = remove_node t key Backoff.default != Nil
-
-  (* *)
-
-  let rec snapshot t ~clear backoff =
-    let r = get t in
-    if try_resize t r (Array.length r.buckets) ~clear then begin
-      (* At this point the resize has been completed and a new array is used for
-         buckets and [r.buckets] now has an immutable copy of what was in the hash
-         table. *)
-      let snapshot = r.buckets in
-      let rec loop i kvs () =
-        match kvs with
-        | Nil ->
-            if i = Array.length snapshot then Seq.Nil
-            else
-              loop (i + 1)
-                (match Atomic.get (Array.get snapshot i) with
-                | B (Resize spine_r) -> spine_r.spine
-                | B (Nil | Cons _) ->
-                    (* After resize only [Resize] values should be left in the old
-                       buckets. *)
-                    assert false)
-                ()
-        | Cons r -> Seq.Cons ((r.key, r.value), loop i r.rest)
-      in
-      loop 0 Nil
-    end
-    else snapshot t ~clear (Backoff.once backoff)
-
-  let remove_all t = snapshot t ~clear:true Backoff.default
 end
 
 module Picos = struct
@@ -884,14 +854,6 @@ module Picos = struct
         error_returned ()
       end
 
-    type _ Effect.t +=
-      | Cancel_after : {
-          seconds : float;
-          exn_bt : Exn_bt.t;
-          computation : 'a t;
-        }
-          -> unit Effect.t
-
     let block t =
       let trigger = Trigger.create () in
       if try_attach t trigger then begin
@@ -997,8 +959,6 @@ module Picos = struct
 
     let spawn ~forbid computation mains =
       Effect.perform @@ Spawn { forbid; computation; mains }
-
-    type _ Effect.t += Yield : unit Effect.t
 
     module Maybe = struct
       type t = T : [< `Nothing | `Fiber ] tdt -> t [@@unboxed]
@@ -1504,10 +1464,6 @@ module Picos_rc = struct
   let[@inline never] disposed () =
     invalid_arg "resource already previously disposed"
 
-  let bt =
-    if Printexc.backtrace_status () then None
-    else Some (Printexc.get_callstack 0)
-
   let count_shift = 2
   let count_1 = 1 lsl count_shift
   let dispose_bit = 0b01
@@ -1536,19 +1492,16 @@ module Picos_rc = struct
   module Make (Resource : Resource) () = struct
     module Resource = Resource
 
-    type entry = { count_and_bits : int; bt : Printexc.raw_backtrace }
+    type entry = { count_and_bits : int }
 
     let ht = Picos_htbl.create ~hashed_type:(module Resource) ()
 
     type t = Resource.t
 
     let create ?(dispose = true) t =
-      let bt =
-        match bt with Some bt -> bt | None -> Printexc.get_callstack 15
-      in
       if
         Picos_htbl.try_add ht t
-          (Atomic.make { count_and_bits = count_1 lor Bool.to_int dispose; bt })
+          (Atomic.make { count_and_bits = count_1 lor Bool.to_int dispose })
       then t
       else begin
         (* We assume resources may only be reused after they have been
@@ -1566,7 +1519,7 @@ module Picos_rc = struct
       then disposed ()
       else
         let count_and_bits = before.count_and_bits + count_1 in
-        let after = { before with count_and_bits } in
+        let after = { count_and_bits } in
         if not (Atomic.compare_and_set entry before after) then
           incr t entry (Backoff.once backoff)
 
@@ -1580,13 +1533,11 @@ module Picos_rc = struct
       let count_and_bits = (before.count_and_bits - count_1) lor closed_bit in
       if count_and_bits < 0 then disposed ()
       else
-        let after = { before with count_and_bits } in
+        let after = { count_and_bits } in
         if not (Atomic.compare_and_set entry before after) then
           decr closed_bit t entry (Backoff.once backoff)
         else if count_and_bits < count_1 then begin
           Picos_htbl.try_remove ht t |> ignore;
-          (* We must dispose the resource as the last step, because the value
-             might be reused after it has been disposed. *)
           if after.count_and_bits land dispose_bit <> 0 then Resource.dispose t
         end
 
@@ -1599,14 +1550,6 @@ module Picos_rc = struct
             | None | Some false -> 0
             | Some true -> closed_bit)
             t entry Backoff.default
-
-    type info = {
-      resource : Resource.t;
-      count : int;
-      closed : bool;
-      dispose : bool;
-      bt : Printexc.raw_backtrace;
-    }
   end
 end
 
@@ -1638,26 +1581,6 @@ module Picos_select = struct
   }
 
   let config = { bits = 0; intr_sig = 0; intr_sigs = [] }
-
-  (* *)
-
-  type return =
-    | Return : {
-        value : 'a;
-        computation : 'a Computation.t;
-        mutable alive : bool;
-      }
-        -> return
-
-  (** We use random numbers as keys for the awaiters. *)
-  module RandomInt = struct
-    type t = int
-
-    let equal = Int.equal
-    let hash = Fun.id
-  end
-
-  let chld_awaiters = Picos_htbl.create ~hashed_type:(module RandomInt) ()
 
   (* *)
 
@@ -1935,13 +1858,7 @@ module Picos_select = struct
     end
 
   and handle_signal signal =
-    if signal = Sys.sigchld then begin
-      Picos_htbl.remove_all chld_awaiters
-      |> Seq.iter @@ fun (_, Return r) ->
-         r.alive <- false;
-         Computation.return r.computation r.value
-    end
-    else if signal = config.intr_sig then
+    if signal = config.intr_sig then
       let (Req r) = Picos_thread.TLS.get intr_key in
       Computation.return r.computation Signaled
 
@@ -1997,16 +1914,6 @@ module Picos_select = struct
     | None ->
         invalid_arg "seconds should be between 0 to pow(2, 53) nanoseconds"
     | Some span -> Mtime.Span.add (Mtime_clock.elapsed ()) span
-
-  let[@alert "-handler"] cancel_after computation ~seconds exn_bt =
-    let time = to_deadline ~seconds in
-    let entry = Cancel_at { time; exn_bt; computation } in
-    let s = get () in
-    let id = next_id s in
-    add_timeout s id entry;
-    let remover = Trigger.from_action s id remove_action in
-    if not (Computation.try_attach computation remover) then
-      Trigger.signal remover
 
   (* *)
 
@@ -2197,7 +2104,6 @@ module Picos_fifos = struct
 
   type ready =
     | Spawn of Fiber.t * (unit -> unit)
-    | Continue of Fiber.t * (unit, unit) Effect.Deep.continuation
     | Resume of Fiber.t * (Exn_bt.t option, unit) Effect.Deep.continuation
 
   type t = {
@@ -2227,11 +2133,6 @@ module Picos_fifos = struct
     match Queue.pop_exn t.ready with
     | Spawn (fiber, main) ->
         let current = Some (fun k -> Effect.Deep.continue k fiber)
-        and yield =
-          Some
-            (fun k ->
-              Queue.push t.ready (Continue (fiber, k));
-              next t)
         and discontinue = Some (fun k -> Fiber.continue fiber k ()) in
         let[@alert "-handler"] effc (type a) :
             a Effect.t -> ((a, _) Effect.Deep.continuation -> _) option =
@@ -2243,19 +2144,6 @@ module Picos_fifos = struct
                 spawn t 0 r.forbid (Packed r.computation) r.mains;
                 continue
               end
-          | Fiber.Yield -> yield
-          | Computation.Cancel_after r -> begin
-              if Fiber.is_canceled fiber then discontinue
-              else
-                match
-                  Picos_select.cancel_after r.computation ~seconds:r.seconds
-                    r.exn_bt
-                with
-                | () -> continue
-                | exception exn ->
-                    let exn_bt = Exn_bt.get exn in
-                    Some (fun k -> Exn_bt.discontinue k exn_bt)
-            end
           | Trigger.Await trigger ->
               Some
                 (fun k ->
@@ -2265,7 +2153,6 @@ module Picos_fifos = struct
           | _ -> None
         in
         Effect.Deep.match_with main () { retc = t.retc; exnc = raise; effc }
-    | Continue (fiber, k) -> Fiber.continue fiber k ()
     | Resume (fiber, k) -> Fiber.resume fiber k
     | exception Queue.Empty ->
         if Atomic.get t.num_alive_fibers <> 0 then begin
