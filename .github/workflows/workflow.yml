@@ -1,0 +1,156 @@
+name: build-and-test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-5_1_x:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        ocaml-compiler:
+          - 5.1.x
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Use OCaml ${{ matrix.ocaml-compiler }}
+        uses: ocaml/setup-ocaml@v2
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-compiler }}
+
+      - name: Install dependencies
+        run: opam install -y dune mtime psq
+
+      - name: Build
+        run: opam exec -- dune build
+
+      - name: Test 0
+        run: opam exec -- dune test --force
+      - name: Test 1
+        run: opam exec -- dune test --force
+      - name: Test 2
+        run: opam exec -- dune test --force
+      - name: Test 3
+        run: opam exec -- dune test --force
+      - name: Test 4
+        run: opam exec -- dune test --force
+      - name: Test 5
+        run: opam exec -- dune test --force
+      - name: Test 6
+        run: opam exec -- dune test --force
+      - name: Test 7
+        run: opam exec -- dune test --force
+      - name: Test 8
+        run: opam exec -- dune test --force
+      - name: Test 9
+        run: opam exec -- dune test --force
+      - name: Test 10
+        run: opam exec -- dune test --force
+      - name: Test 11
+        run: opam exec -- dune test --force
+      - name: Test 12
+        run: opam exec -- dune test --force
+      - name: Test 13
+        run: opam exec -- dune test --force
+      - name: Test 14
+        run: opam exec -- dune test --force
+      - name: Test 15
+        run: opam exec -- dune test --force
+      - name: Test 16
+        run: opam exec -- dune test --force
+      - name: Test 17
+        run: opam exec -- dune test --force
+      - name: Test 18
+        run: opam exec -- dune test --force
+      - name: Test 19
+        run: opam exec -- dune test --force
+      - name: Test 20
+        run: opam exec -- dune test --force
+      - name: Test 21
+        run: opam exec -- dune test --force
+      - name: Test 22
+        run: opam exec -- dune test --force
+      - name: Test 23
+        run: opam exec -- dune test --force
+      - name: Test 24
+        run: opam exec -- dune test --force
+      - name: Test 25
+        run: opam exec -- dune test --force
+      - name: Test 26
+        run: opam exec -- dune test --force
+      - name: Test 27
+        run: opam exec -- dune test --force
+      - name: Test 28
+        run: opam exec -- dune test --force
+      - name: Test 29
+        run: opam exec -- dune test --force
+      - name: Test 30
+        run: opam exec -- dune test --force
+      - name: Test 31
+        run: opam exec -- dune test --force
+      - name: Test 32
+        run: opam exec -- dune test --force
+      - name: Test 33
+        run: opam exec -- dune test --force
+      - name: Test 34
+        run: opam exec -- dune test --force
+      - name: Test 35
+        run: opam exec -- dune test --force
+      - name: Test 36
+        run: opam exec -- dune test --force
+      - name: Test 37
+        run: opam exec -- dune test --force
+      - name: Test 38
+        run: opam exec -- dune test --force
+      - name: Test 39
+        run: opam exec -- dune test --force
+      - name: Test 40
+        run: opam exec -- dune test --force
+      - name: Test 41
+        run: opam exec -- dune test --force
+      - name: Test 42
+        run: opam exec -- dune test --force
+      - name: Test 43
+        run: opam exec -- dune test --force
+      - name: Test 44
+        run: opam exec -- dune test --force
+      - name: Test 45
+        run: opam exec -- dune test --force
+      - name: Test 46
+        run: opam exec -- dune test --force
+      - name: Test 47
+        run: opam exec -- dune test --force
+      - name: Test 48
+        run: opam exec -- dune test --force
+      - name: Test 49
+        run: opam exec -- dune test --force
+      - name: Test 50
+        run: opam exec -- dune test --force
+      - name: Test 51
+        run: opam exec -- dune test --force
+      - name: Test 52
+        run: opam exec -- dune test --force
+      - name: Test 53
+        run: opam exec -- dune test --force
+      - name: Test 54
+        run: opam exec -- dune test --force
+      - name: Test 55
+        run: opam exec -- dune test --force
+      - name: Test 56
+        run: opam exec -- dune test --force
+      - name: Test 57
+        run: opam exec -- dune test --force
+      - name: Test 58
+        run: opam exec -- dune test --force
+      - name: Test 59
+        run: opam exec -- dune test --force
