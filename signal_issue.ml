@@ -806,10 +806,8 @@ module Picos = struct
           end
           else try_terminate t after (Backoff.once backoff)
 
-    let returned_unit = Returned (Obj.magic ())
-
-    let make_returned value =
-      if value == Obj.magic () then returned_unit else Returned value
+    let returned_unit = Returned ()
+    let[@inline never] make_returned value = Returned value
 
     let try_return t value =
       try_terminate t (make_returned value) Backoff.default
@@ -1224,7 +1222,7 @@ module Picos_structured = struct
     type ('a, _) tdt =
       | Nothing : ('a, [> `Nothing ]) tdt
       | Resource : {
-          mutable resource : 'a;
+          resource : 'a;
           release : 'a -> unit;
           moved : Trigger.t;
         }
@@ -1233,11 +1231,9 @@ module Picos_structured = struct
     let ( let^ ) (release, acquire) body =
       let moveable = Atomic.make Nothing in
       let acquire () =
-        let (Resource r as state : (_, [ `Resource ]) tdt) =
-          Resource
-            { resource = Obj.magic (); release; moved = Trigger.create () }
+        let (Resource _ as state : (_, [ `Resource ]) tdt) =
+          Resource { resource = acquire (); release; moved = Trigger.create () }
         in
-        r.resource <- acquire ();
         Atomic.set moveable state;
         moveable
       in
