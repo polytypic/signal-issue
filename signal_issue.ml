@@ -3,74 +3,28 @@ module Picos_thread = struct
   let is_main_thread () = Thread.id (Thread.self ()) = main_thread
 
   module TLS = struct
-    let () = assert (Obj.field (Obj.repr (Thread.self ())) 1 = Obj.repr ())
+    (* In this program we only use TLS from the main thread. *)
 
-    type 'a key = { index : int; compute : unit -> 'a }
+    type 'a state = Compute of (unit -> 'a) | Value of 'a
 
-    let counter = Atomic.make 0
-    let[@inline] sentinel_value_for_uninit_tls_ () : Obj.t = Obj.repr counter
+    let new_key compute = ref (Compute compute)
 
-    let new_key compute : _ key =
-      let index = Atomic.fetch_and_add counter 1 in
-      { index; compute }
+    let get key =
+      assert (is_main_thread ());
+      match !key with
+      | Compute compute ->
+          let value = compute () in
+          key := Value value;
+          value
+      | Value value -> value
 
-    type thread_internal_state = {
-      _id : int;
-      mutable tls : Obj.t;
-      _other : Obj.t;
-    }
-
-    let ceil_pow_2_minus_1 (n : int) : int =
-      let n = n lor (n lsr 1) in
-      let n = n lor (n lsr 2) in
-      let n = n lor (n lsr 4) in
-      let n = n lor (n lsr 8) in
-      let n = n lor (n lsr 16) in
-      if Sys.int_size > 32 then n lor (n lsr 32) else n
-
-    let[@inline never] grow_tls (old : Obj.t array) (index : int) : Obj.t array
-        =
-      let new_length = ceil_pow_2_minus_1 (index + 1) in
-      let new_ = Array.make new_length (sentinel_value_for_uninit_tls_ ()) in
-      Array.blit old 0 new_ 0 (Array.length old);
-      new_
-
-    let[@inline] get_tls_ (index : int) : Obj.t array =
-      let thread : thread_internal_state = Obj.magic (Thread.self ()) in
-      let tls = thread.tls in
-      if Obj.is_int tls then (
-        let new_tls = grow_tls [||] index in
-        thread.tls <- Obj.repr new_tls;
-        new_tls)
-      else
-        let tls = (Obj.obj tls : Obj.t array) in
-        if index < Array.length tls then tls
-        else
-          let new_tls = grow_tls tls index in
-          thread.tls <- Obj.repr new_tls;
-          new_tls
-
-    let[@inline never] get_compute_ tls (key : 'a key) : 'a =
-      let value = key.compute () in
-      Array.set tls key.index (Obj.repr (Sys.opaque_identity value));
-      value
-
-    let[@inline] get (key : 'a key) : 'a =
-      let tls = get_tls_ key.index in
-      let value = Array.get tls key.index in
-      if value != sentinel_value_for_uninit_tls_ () then Obj.obj value
-      else get_compute_ tls key
-
-    let[@inline] set key value : unit =
-      let tls = get_tls_ key.index in
-      Array.set tls key.index (Obj.repr (Sys.opaque_identity value))
+    let set key value =
+      assert (is_main_thread ());
+      key := Value value
   end
 end
 
-module Multicore_magic = struct
-  let copy_as_padded = Fun.id
-  let instantaneous_domain_index () = 0
-end
+let instantaneous_domain_index () = 0
 
 module Backoff = struct
   let single_mask = Bool.to_int (Domain.recommended_domain_count () = 1) - 1
@@ -152,9 +106,9 @@ module Picos_mpsc_queue = struct
     invalid_arg "multiple consumers not allowed"
 
   let create () =
-    let tail = Multicore_magic.copy_as_padded @@ Atomic.make (T Tail) in
-    let head = Multicore_magic.copy_as_padded @@ Atomic.make (H Head) in
-    Multicore_magic.copy_as_padded { tail; head }
+    let tail = Atomic.make (T Tail) in
+    let head = Atomic.make (H Head) in
+    { tail; head }
 
   let rec push_head head (Cons r as after : (_, [< `Cons ]) tdt) backoff =
     let before = Atomic.get head in
@@ -301,13 +255,9 @@ module Picos_htbl = struct
           (Hashed_type.equal, Hashed_type.hash)
     in
     let buckets = Array.init min_buckets @@ fun _ -> Atomic.make (B Nil) in
-    let non_linearizable_size =
-      [| Atomic.make 0 |> Multicore_magic.copy_as_padded |]
-    in
+    let non_linearizable_size = [| Atomic.make 0 |] in
     let pending = Nothing in
-    { hash; buckets; equal; non_linearizable_size; pending }
-    |> Multicore_magic.copy_as_padded |> Atomic.make
-    |> Multicore_magic.copy_as_padded
+    { hash; buckets; equal; non_linearizable_size; pending } |> Atomic.make
 
   (* *)
 
@@ -464,7 +414,6 @@ module Picos_htbl = struct
         then
           let new_r =
             { r with buckets; non_linearizable_size; pending = Nothing }
-            |> Multicore_magic.copy_as_padded
           in
           if Atomic.compare_and_set t r new_r then new_r
           else finish t (Atomic.get t)
@@ -497,7 +446,7 @@ module Picos_htbl = struct
     let non_linearizable_size =
       if clear then
         Array.init (Array.length r.non_linearizable_size) @@ fun _ ->
-        Atomic.make 0 |> Multicore_magic.copy_as_padded
+        Atomic.make 0
       else r.non_linearizable_size
     in
     let new_r =
@@ -510,7 +459,7 @@ module Picos_htbl = struct
        end
 
   let rec adjust_estimated_size t r mask delta result =
-    let i = Multicore_magic.instantaneous_domain_index () in
+    let i = instantaneous_domain_index () in
     let n = Array.length r.non_linearizable_size in
     if i < n then begin
       Atomic.fetch_and_add (Array.get r.non_linearizable_size i) delta |> ignore;
@@ -535,13 +484,9 @@ module Picos_htbl = struct
            minus 1 and so the size of the array/block including header word will
            be a power of 2. *)
         Array.init (n + n + 1) @@ fun i ->
-        if i < n then Array.get r.non_linearizable_size i
-        else Atomic.make 0 |> Multicore_magic.copy_as_padded
+        if i < n then Array.get r.non_linearizable_size i else Atomic.make 0
       in
-      let new_r =
-        { r with non_linearizable_size = new_cs }
-        |> Multicore_magic.copy_as_padded
-      in
+      let new_r = { r with non_linearizable_size = new_cs } in
       let r =
         if Atomic.compare_and_set t r new_r then new_r else Atomic.get t
       in
@@ -1008,7 +953,7 @@ module Picos_sync = struct
 
     let create ?(padded = false) () =
       let t = Atomic.make Unlocked in
-      if padded then Multicore_magic.copy_as_padded t else t
+      if padded then t else t
 
     let locked_nothing =
       Locked { fiber = Fiber.Maybe.nothing; head = []; tail = [] }
@@ -1112,7 +1057,7 @@ module Picos_sync = struct
 
     let create ?(padded = false) () =
       let t = Atomic.make Empty in
-      if padded then Multicore_magic.copy_as_padded t else t
+      if padded then t else t
 
     let rec signal t backoff =
       match Atomic.get t with
@@ -1554,10 +1499,7 @@ module Picos_fd = struct
     type t = Unix.file_descr
 
     let equal : t -> t -> bool = ( == )
-
-    let hash (fd : t) =
-      if Obj.is_int (Obj.repr fd) then Obj.magic fd else Hashtbl.hash fd
-
+    let hash (fd : t) = Hashtbl.hash fd
     let dispose = Unix.close
   end
 
@@ -1899,11 +1841,11 @@ module Picos_select = struct
       | None -> ()
     else add_timeout s id entry
 
-  let rec remove_action _trigger s id =
+  let rec remove_action trigger s id =
     let before = Atomic.get s.timeouts in
     let after = Q.remove id before in
     if not (Atomic.compare_and_set s.timeouts before after) then
-      remove_action (Obj.magic ()) s id
+      remove_action trigger s id
 
   let to_deadline ~seconds =
     match Mtime.Span.of_float_ns (seconds *. 1_000_000_000.) with
