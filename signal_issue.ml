@@ -73,8 +73,6 @@ module Multicore_magic = struct
 end
 
 module Backoff = struct
-  type t = int
-
   let single_mask = Bool.to_int (Domain.recommended_domain_count () = 1) - 1
   let bits = 5
   let max_wait_log = 30 (* [Random.bits] returns 30 random bits. *)
@@ -89,12 +87,7 @@ module Backoff = struct
     lor (lower_wait_log lsl bits) lor lower_wait_log
 
   let get_upper_wait_log backoff = backoff lsr (bits * 2)
-  let get_lower_wait_log backoff = (backoff lsr bits) land mask
   let get_wait_log backoff = backoff land mask
-
-  let reset backoff =
-    let lower_wait_log = get_lower_wait_log backoff in
-    backoff land lnot mask lor lower_wait_log
 
   let[@inline never] once backoff =
     let wait_log = get_wait_log backoff in
@@ -125,9 +118,6 @@ module Exn_bt = struct
 
   let raise t = Printexc.raise_with_backtrace t.exn t.bt
   let discontinue k t = Effect.Deep.discontinue_with_backtrace k t.exn t.bt
-
-  let discontinue_with k t handler =
-    Effect.Shallow.discontinue_with_backtrace k t.exn t.bt handler
 end
 
 module Picos_thread_atomic = struct
@@ -249,53 +239,9 @@ module Picos_mpsc_queue = struct
       pop_exn t backoff (Atomic.get t.head)
 
   let[@inline] pop_exn t = pop_exn t Backoff.default (Atomic.get t.head)
-
-  let rec prepend_to_seq t tl =
-    match t with
-    | H Head -> tl
-    | H (Cons r) -> fun () -> Seq.Cons (r.value, prepend_to_seq r.next tl)
-
-  let rev = function T Tail -> H Head | T (Snoc r) -> H (rev_to Head (Snoc r))
-
-  let rev_prepend_to_seq t tl =
-    let t = ref (Either.Left t) in
-    fun () ->
-      let t =
-        match !t with
-        | Left t' ->
-            let t' = rev t' in
-            t := Right t';
-            t'
-        | Right t' -> t'
-      in
-      prepend_to_seq t tl ()
-
-  let rec drop_tail_after cut = function
-    | T Tail -> impossible ()
-    | T (Snoc r) ->
-        if r.prev == cut then r.prev <- T Tail else drop_tail_after cut r.prev
-
-  let rec drop_head_after cut = function
-    | H Head -> impossible ()
-    | H (Cons r) ->
-        if r.next == cut then r.next <- H Head else drop_head_after cut r.next
-
-  let rec pop_all t =
-    let head = Atomic.get t.head in
-    let tail = Atomic.get t.tail in
-    if Atomic.get (Sys.opaque_identity t.head) == head then begin
-      if not (Atomic.compare_and_set t.tail tail (T Tail)) then
-        drop_tail_after tail (Atomic.get t.tail);
-      if not (Atomic.compare_and_set t.head head (H Head)) then
-        drop_head_after head (Atomic.get t.head);
-      Seq.empty |> rev_prepend_to_seq tail |> prepend_to_seq head
-    end
-    else pop_all t
 end
 
 module Picos_htbl = struct
-  let[@inline never] impossible () = failwith "impossible"
-
   type 'k hashed_type = (module Stdlib.Hashtbl.HashedType with type t = 'k)
 
   type ('k, 'v, _) tdt =
@@ -333,8 +279,6 @@ module Picos_htbl = struct
     non_linearizable_size : int Atomic.t array;
     pending : ('k, 'v) pending;
   }
-
-  type ('k, 'v) t = ('k, 'v) state Atomic.t
 
   let min_buckets = 16
 
@@ -703,11 +647,6 @@ module Picos_htbl = struct
 
   let try_remove t key = remove_node t key Backoff.default != Nil
 
-  let remove_exn t key =
-    match remove_node t key Backoff.default with
-    | Nil -> raise_notrace Not_found
-    | Cons r -> r.value
-
   (* *)
 
   let rec snapshot t ~clear backoff =
@@ -736,52 +675,7 @@ module Picos_htbl = struct
     end
     else snapshot t ~clear (Backoff.once backoff)
 
-  let to_seq t = snapshot t ~clear:false Backoff.default
   let remove_all t = snapshot t ~clear:true Backoff.default
-
-  (* *)
-
-  let rec try_find_random_non_empty_bucket buckets seed i =
-    let bucket = Array.get buckets i in
-    match Atomic.get bucket with
-    | B Nil | B (Resize { spine = Nil }) ->
-        let mask = Array.length buckets - 1 in
-        let i = (i + 1) land mask in
-        if i <> seed land mask then
-          try_find_random_non_empty_bucket buckets seed i
-        else Nil
-    | B (Cons cons_r) | B (Resize { spine = Cons cons_r }) -> Cons cons_r
-
-  let try_find_random_non_empty_bucket t =
-    let buckets = (Atomic.get t).buckets in
-    let seed = Random.bits () in
-    try_find_random_non_empty_bucket buckets seed
-      (seed land (Array.length buckets - 1))
-
-  let rec length spine n =
-    match spine with Nil -> n | Cons r -> length r.rest (n + 1)
-
-  let length spine = length spine 0
-
-  let rec nth spine i =
-    match spine with
-    | Nil -> impossible ()
-    | Cons r -> if i <= 0 then r.key else nth r.rest (i - 1)
-
-  let find_random_exn t =
-    match try_find_random_non_empty_bucket t with
-    | (Cons cons_r as spine : (_, _, [< `Nil | `Cons ]) tdt) ->
-        (* We found a non-empty bucket - the fast way. *)
-        if cons_r.rest == Nil then cons_r.key
-        else
-          let n = length spine in
-          nth spine (Random.int n)
-    | Nil ->
-        (* We couldn't find a non-empty bucket - the slow way. *)
-        let bindings = to_seq t |> Array.of_seq in
-        let n = Array.length bindings in
-        if n <> 0 then fst (Array.get bindings (Random.int n))
-        else raise_notrace Not_found
 end
 
 module Picos = struct
@@ -835,9 +729,6 @@ module Picos = struct
   end
 
   module Computation = struct
-    let[@inline never] error_negative_or_nan () =
-      invalid_arg "seconds must be non-negative"
-
     let[@inline never] error_returned () = invalid_arg "already returned"
 
     type 'a state =
@@ -950,9 +841,6 @@ module Picos = struct
     let make_returned value =
       if value == Obj.magic () then returned_unit else Returned value
 
-    let returned value = Atomic.make (make_returned value)
-    let finished = Atomic.make (make_returned ())
-
     let try_return t value =
       try_terminate t (make_returned value) Backoff.default
 
@@ -974,12 +862,6 @@ module Picos = struct
       | Canceled exn_bt -> Exn_bt.raise exn_bt
       | Returned _ | Continue _ -> ()
 
-    let peek t =
-      match Atomic.get t with
-      | Canceled exn_bt -> Some (Error exn_bt)
-      | Returned value -> Some (Ok value)
-      | Continue _ -> None
-
     let propagate _ from into =
       match Atomic.get from with
       | Returned _ | Continue _ -> ()
@@ -987,9 +869,6 @@ module Picos = struct
           try_terminate into after Backoff.default |> ignore
 
     let canceler ~from ~into = Trigger.from_action from into propagate
-
-    let check_non_negative seconds =
-      if not (0.0 <= seconds) then error_negative_or_nan ()
 
     let rec get_or block t =
       match Atomic.get t with
@@ -1013,10 +892,6 @@ module Picos = struct
         }
           -> unit Effect.t
 
-    let cancel_after computation ~seconds exn_bt =
-      check_non_negative seconds;
-      Effect.perform (Cancel_after { seconds; exn_bt; computation })
-
     let block t =
       let trigger = Trigger.create () in
       if try_attach t trigger then begin
@@ -1029,7 +904,6 @@ module Picos = struct
       else t
 
     let await t = get_or block t
-    let wait t = if is_running t then ignore (block t)
   end
 
   module Fiber = struct
@@ -1051,8 +925,6 @@ module Picos = struct
     let create ~forbid computation =
       create_packed ~forbid (Computation.Packed computation)
 
-    let has_forbidden (Fiber r : t) = r.forbid
-
     let is_canceled (Fiber r : t) =
       (not r.forbid)
       &&
@@ -1073,28 +945,12 @@ module Picos = struct
         let (Packed computation) = r.packed in
         Computation.check computation
 
-    let[@inline] equal t1 t2 = t1 == t2
-
     let exchange (Fiber r : t) ~forbid =
       let before = r.forbid in
       r.forbid <- forbid;
       before
 
     let set (Fiber r : t) ~forbid = r.forbid <- forbid
-
-    let explicitly (Fiber r : t) body ~forbid =
-      if r.forbid = forbid then body ()
-      else
-        match body (r.forbid <- forbid) with
-        | value ->
-            r.forbid <- not forbid;
-            value
-        | exception exn ->
-            r.forbid <- not forbid;
-            raise exn
-
-    let forbid t body = explicitly t body ~forbid:true
-    let permit t body = explicitly t body ~forbid:false
 
     let try_suspend (Fiber r : t) trigger x y resume =
       let (Packed computation) = r.packed in
@@ -1144,8 +1000,6 @@ module Picos = struct
 
     type _ Effect.t += Yield : unit Effect.t
 
-    let yield () = Effect.perform Yield
-
     module Maybe = struct
       type t = T : [< `Nothing | `Fiber ] tdt -> t [@@unboxed]
 
@@ -1167,21 +1021,6 @@ module Picos = struct
             of_fiber fiber
         | Some false -> nothing
     end
-
-    exception Done
-
-    let done_bt = Exn_bt.get_callstack 0 Done
-
-    let sleep ~seconds =
-      let sleep = Computation.create ~mode:`LIFO () in
-      Computation.cancel_after ~seconds sleep done_bt;
-      let trigger = Trigger.create () in
-      if Computation.try_attach sleep trigger then
-        match Trigger.await trigger with
-        | None -> ()
-        | Some exn_bt ->
-            Computation.finish sleep;
-            Exn_bt.raise exn_bt
   end
 end
 
@@ -1313,24 +1152,9 @@ module Picos_sync = struct
       | Empty
       | Queue of { head : Trigger.t list; tail : Trigger.t list }
 
-    type t = state Atomic.t
-
     let create ?(padded = false) () =
       let t = Atomic.make Empty in
       if padded then Multicore_magic.copy_as_padded t else t
-
-    let broadcast t =
-      if Atomic.get t != Empty then
-        match Atomic.exchange t Empty with
-        | Empty -> ()
-        | Queue r ->
-            List.iter Trigger.signal r.head;
-            List.iter Trigger.signal (List.rev r.tail)
-
-    (* We try to avoid starvation of signal by making it so that when, at the start
-       of signal or wait, the head is empty, the tail is reversed into the head.
-       This way both signal and wait attempt O(1) and O(n) operations at the same
-       time. *)
 
     let rec signal t backoff =
       match Atomic.get t with
@@ -1359,9 +1183,6 @@ module Picos_sync = struct
     let signal t = signal t Backoff.default
 
     let rec cleanup backoff trigger t =
-      (* We have been canceled.  If we can't drop our trigger from the variable, we
-         signal the next trigger in queue to make sure each signal wakes up at least
-         one non-canceled waiter if possible. *)
       match Atomic.get t with
       | Empty -> ()
       | Queue r as before -> begin
@@ -1423,8 +1244,6 @@ module Picos_structured = struct
   module Finally = struct
     open Picos
 
-    type 'a finally = ('a -> unit) * (unit -> 'a)
-
     let[@inline] finally release acquire = (release, acquire)
 
     (** This function is marked [@inline never] to ensure that there are no
@@ -1450,8 +1269,6 @@ module Picos_structured = struct
           moved : Trigger.t;
         }
           -> ('a, [> `Resource ]) tdt
-
-    type 'a moveable = ('a, [ `Nothing | `Resource ]) tdt Atomic.t
 
     let ( let^ ) (release, acquire) body =
       let moveable = Atomic.make Nothing in
@@ -1502,8 +1319,6 @@ module Picos_structured = struct
   end
 
   module Control = struct
-    open Picos
-
     exception Terminate
 
     let terminate_bt = Exn_bt.get_callstack 0 Terminate
@@ -1553,17 +1368,6 @@ module Picos_structured = struct
 
       let push t exn_bt = push t exn_bt Backoff.default
     end
-
-    let raise_if_canceled () = Fiber.check (Fiber.current ())
-    let yield = Fiber.yield
-    let sleep = Fiber.sleep
-
-    let block () =
-      match Trigger.await (Trigger.create ()) with
-      | None -> failwith "impossible"
-      | Some exn_bt -> Exn_bt.raise exn_bt
-
-    let protect thunk = Fiber.forbid (Fiber.current ()) thunk
   end
 
   module Bundle = struct
@@ -1680,17 +1484,6 @@ module Picos_structured = struct
         end;
         Bundle.decr t
 
-    let wrap_any t main =
-      Bundle.unsafe_incr t;
-      fun () ->
-        if Bundle.is_running t then begin
-          try
-            main ();
-            Bundle.terminate t
-          with exn -> Bundle.error t (Exn_bt.get exn)
-        end;
-        Bundle.decr t
-
     let run actions wrap =
       Bundle.join_after @@ fun t ->
       try
@@ -1701,7 +1494,6 @@ module Picos_structured = struct
         raise exn
 
     let all actions = run actions wrap_all
-    let any actions = run actions wrap_any
   end
 end
 
@@ -1815,15 +1607,6 @@ module Picos_rc = struct
       dispose : bool;
       bt : Printexc.raw_backtrace;
     }
-
-    let infos () =
-      Picos_htbl.to_seq ht
-      |> Seq.map @@ fun (resource, entry) ->
-         let { count_and_bits; bt } = Atomic.get entry in
-         let count = count_and_bits lsr count_shift in
-         let closed = count_and_bits land closed_bit <> 0 in
-         let dispose = count_and_bits land dispose_bit <> 0 in
-         { resource; count; closed; dispose; bt }
   end
 end
 
@@ -1979,24 +1762,13 @@ module Picos_select = struct
 
   let rec wakeup s from =
     match Atomic.get s.phase with
-    | Process | Waking_up ->
-        (* The thread will process the fds and timeouts before next select. *)
-        ()
+    | Process | Waking_up -> ()
     | Continue ->
-        if Atomic.compare_and_set s.phase Continue Process then
-          (* We managed to signal the wakeup before the thread was ready to call
-             select and the thread will notice this without us needing to write to
-             the pipe. *)
-          ()
-        else
-          (* Either the thread called select or another wakeup won the race.  We
-             need to retry. *)
-          wakeup s from
+        if Atomic.compare_and_set s.phase Continue Process then ()
+        else wakeup s from
     | Select ->
         if Atomic.compare_and_set s.phase Select Waking_up then
           if s.state == from then
-            (* We are now responsible for writing to the pipe to force the thread
-               to exit the select. *)
             let n = Unix.write s.pipe_out s.byte 0 1 in
             assert (n = 1)
 
@@ -2271,8 +2043,6 @@ module Picos_select = struct
   (* *)
 
   module Intr = struct
-    type t = req
-
     let[@inline] use = function
       | R Nothing -> ()
       | R (Req r) -> r.unused <- false
@@ -2341,35 +2111,6 @@ module Picos_select = struct
             decr Backoff.default
           end
   end
-
-  (* *)
-
-  let rec insert return =
-    let id = Random.bits () in
-    if Picos_htbl.try_add chld_awaiters id return then id else insert return
-
-  let[@alert "-handler"] return_on_sigchld computation value =
-    if
-      config.bits
-      land (select_thread_running_on_main_domain_bit lor handle_sigchld_bit)
-      = handle_sigchld_bit
-    then get () |> ignore;
-    let return = Return { value; computation; alive = true } in
-    let id = insert return in
-    let remover =
-      Trigger.from_action id return
-      @@ fun _trigger id (Return this_r as this) ->
-      if this_r.alive then begin
-        this_r.alive <- false;
-        match Picos_htbl.remove_exn chld_awaiters id with
-        | Return that_r as that ->
-            if this != that then
-              Computation.return that_r.computation that_r.value
-        | exception Not_found -> ()
-      end
-    in
-    if not (Computation.try_attach computation remover) then
-      Trigger.signal remover
 end
 
 module Picos_stdio = struct
@@ -2642,10 +2383,12 @@ let main () =
   begin
     Bundle.join_after @@ fun bundle ->
     Bundle.fork bundle server;
-    ( Mutex.protect mutex @@ fun () ->
+    begin
+      Mutex.protect mutex @@ fun () ->
       while !server_addr == loopback_0 do
         Condition.wait condition mutex
-      done );
+      done
+    end;
     Run.all [ client "A"; client "B" ];
     Bundle.terminate bundle
   end;
