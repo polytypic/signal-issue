@@ -3,24 +3,11 @@ module Picos_thread = struct
   let is_main_thread () = Thread.id (Thread.self ()) = main_thread
 
   module TLS = struct
-    (* see: https://discuss.ocaml.org/t/a-hack-to-implement-efficient-tls-thread-local-storage/13264 *)
-
-    (* sanity check *)
     let () = assert (Obj.field (Obj.repr (Thread.self ())) 1 = Obj.repr ())
 
-    type 'a key = {
-      index : int;  (** Unique index for this key. *)
-      compute : unit -> 'a;
-          (** Initializer for values for this key. Called at most
-        once per thread. *)
-    }
+    type 'a key = { index : int; compute : unit -> 'a }
 
-    (** Counter used to allocate new keys *)
     let counter = Atomic.make 0
-
-    (** Value used to detect a TLS slot that was not initialized yet.
-    Because [counter] is private and lives forever, no other
-    object the user can see will have the same address. *)
     let[@inline] sentinel_value_for_uninit_tls_ () : Obj.t = Obj.repr counter
 
     let new_key compute : _ key =
@@ -28,14 +15,10 @@ module Picos_thread = struct
       { index; compute }
 
     type thread_internal_state = {
-      _id : int;  (** Thread ID (here for padding reasons) *)
-      mutable tls : Obj.t;  (** Our data, stowed away in this unused field *)
+      _id : int;
+      mutable tls : Obj.t;
       _other : Obj.t;
-          (** Here to avoid lying to ocamlopt/flambda about the size of [Thread.t] *)
     }
-    (** A partial representation of the internal type [Thread.t], allowing us to
-        access the second field (unused after the thread has started) and stash
-        TLS data in it. *)
 
     let ceil_pow_2_minus_1 (n : int) : int =
       let n = n lor (n lsr 1) in
@@ -45,7 +28,6 @@ module Picos_thread = struct
       let n = n lor (n lsr 16) in
       if Sys.int_size > 32 then n lor (n lsr 32) else n
 
-    (** Grow the array so that [index] is valid. *)
     let[@inline never] grow_tls (old : Obj.t array) (index : int) : Obj.t array
         =
       let new_length = ceil_pow_2_minus_1 (index + 1) in
@@ -76,12 +58,8 @@ module Picos_thread = struct
     let[@inline] get (key : 'a key) : 'a =
       let tls = get_tls_ key.index in
       let value = Array.get tls key.index in
-      if value != sentinel_value_for_uninit_tls_ () then
-        (* fast path *)
-        Obj.obj value
-      else
-        (* slow path: we need to compute the initial value *)
-        get_compute_ tls key
+      if value != sentinel_value_for_uninit_tls_ () then Obj.obj value
+      else get_compute_ tls key
 
     let[@inline] set key value : unit =
       let tls = get_tls_ key.index in
@@ -1142,91 +1120,12 @@ module Picos = struct
       let (Packed computation) = r.packed in
       Computation.unsafe_unsuspend computation Backoff.default
 
-    module FLS = struct
-      type 'a key = { index : int; default : non_float; compute : unit -> 'a }
-
-      let compute () = failwith "impossible"
-      let counter = Atomic.make 0
-      let unique = Sys.opaque_identity (Obj.magic counter : non_float)
-
-      let ceil_pow_2_minus_1 n =
-        let n = n lor (n lsr 1) in
-        let n = n lor (n lsr 2) in
-        let n = n lor (n lsr 4) in
-        let n = n lor (n lsr 8) in
-        let n = n lor (n lsr 16) in
-        if Sys.int_size > 32 then n lor (n lsr 32) else n
-
-      let grow old_fls i =
-        let new_length = ceil_pow_2_minus_1 (i + 1) in
-        let new_fls = Array.make new_length unique in
-        Array.blit old_fls 0 new_fls 0 (Array.length old_fls);
-        new_fls
-
-      type 'a initial = Constant of 'a | Computed of (unit -> 'a)
-
-      let new_key initial =
-        let index = Atomic.fetch_and_add counter 1 in
-        match initial with
-        | Constant default ->
-            let default = Sys.opaque_identity (Obj.magic default : non_float) in
-            { index; default; compute }
-        | Computed compute -> { index; default = unique; compute }
-
-      let get (type a) (Fiber r : t) (key : a key) =
-        let fls = r.fls in
-        if key.index < Array.length fls then begin
-          let value = Array.get fls key.index in
-          if value != unique then Sys.opaque_identity (Obj.magic value : a)
-          else
-            let value = key.default in
-            if value != unique then begin
-              (* As the [fls] array was already large enough, we cache the default
-                 value in the array. *)
-              Array.set fls key.index value;
-              Sys.opaque_identity (Obj.magic value : a)
-            end
-            else
-              let value = key.compute () in
-              Array.set fls key.index
-                (Sys.opaque_identity (Obj.magic value : non_float));
-              value
-        end
-        else
-          let value = key.default in
-          if value != unique then Sys.opaque_identity (Obj.magic value : a)
-          else
-            let value = key.compute () in
-            let fls = grow fls key.index in
-            r.fls <- fls;
-            Array.set fls key.index
-              (Sys.opaque_identity (Obj.magic value : non_float));
-            value
-
-      let set (type a) (Fiber r : t) (key : a key) (value : a) =
-        let fls = r.fls in
-        if key.index < Array.length fls then
-          Array.set fls key.index
-            (Sys.opaque_identity (Obj.magic value : non_float))
-        else
-          let fls = grow fls key.index in
-          r.fls <- fls;
-          Array.set fls key.index
-            (Sys.opaque_identity (Obj.magic value : non_float))
-    end
-
     let resume t k = Effect.Deep.continue k (canceled t)
-    let resume_with t k h = Effect.Shallow.continue_with k (canceled t) h
 
     let continue t k v =
       match canceled t with
       | None -> Effect.Deep.continue k v
       | Some exn_bt -> Exn_bt.discontinue k exn_bt
-
-    let continue_with t k v h =
-      match canceled t with
-      | None -> Effect.Shallow.continue_with k v h
-      | Some exn_bt -> Exn_bt.discontinue_with k exn_bt h
 
     type _ Effect.t += Current : t Effect.t
 
@@ -1260,11 +1159,6 @@ module Picos = struct
       let[@inline] unequal x y = x != y || x == nothing
       let[@inline] of_fiber t = T t
 
-      let[@inline] current_if checked =
-        match checked with
-        | None | Some true -> of_fiber (current ())
-        | Some false -> nothing
-
       let[@inline] current_and_check_if checked =
         match checked with
         | None | Some true ->
@@ -1272,10 +1166,6 @@ module Picos = struct
             check fiber;
             of_fiber fiber
         | Some false -> nothing
-
-      let[@inline] check = function
-        | T Nothing -> ()
-        | T (Fiber r) -> check (Fiber r)
     end
 
     exception Done
@@ -1319,16 +1209,9 @@ module Picos_sync = struct
           tail : entry list;
         }
 
-    type t = state Atomic.t
-
     let create ?(padded = false) () =
       let t = Atomic.make Unlocked in
       if padded then Multicore_magic.copy_as_padded t else t
-
-    (* We try to avoid starvation of unlock by making it so that when, at the start
-       of lock or unlock, the head is empty, the tail is reversed into the head.
-       This way both lock and unlock attempt O(1) and O(n) operations at the same
-       time. *)
 
     let locked_nothing =
       Locked { fiber = Fiber.Maybe.nothing; head = []; tail = [] }
@@ -1357,17 +1240,9 @@ module Picos_sync = struct
       if Atomic.compare_and_set t before after then Trigger.signal trigger
       else unlock_as owner t (Backoff.once backoff)
 
-    let[@inline] unlock ?checked t =
-      let owner = Fiber.Maybe.current_if checked in
-      unlock_as owner t Backoff.default
-
     let rec cleanup_as entry t backoff =
-      (* We have been canceled.  If we are the owner, we must unlock the mutex.
-         Otherwise we must remove our entry from the queue. *)
       match Atomic.get t with
       | Locked r as before ->
-          (* At this point we must use strict physical equality [==] rather than
-             [Fiber.Maybe.equal]! *)
           if r.fiber == entry.fiber then unlock_as entry.fiber t backoff
           else if r.head != [] then
             match List_ext.drop_first_or_not_found entry r.head with
@@ -1379,12 +1254,10 @@ module Picos_sync = struct
                 let after = Locked { r with tail } in
                 cancel_as entry t backoff before after
           else
-            let tail =
-              List_ext.drop_first_or_not_found entry r.tail (* wont raise *)
-            in
+            let tail = List_ext.drop_first_or_not_found entry r.tail in
             let after = Locked { r with tail } in
             cancel_as entry t backoff before after
-      | Unlocked -> unlocked () (* impossible *)
+      | Unlocked -> unlocked ()
 
     and cancel_as fiber t backoff before after =
       if not (Atomic.compare_and_set t before after) then
@@ -1419,17 +1292,6 @@ module Picos_sync = struct
             end
             else lock_as fiber t (Backoff.once backoff)
           else owner ()
-
-    let[@inline] lock ?checked t =
-      let fiber = Fiber.Maybe.current_and_check_if checked in
-      lock_as fiber t Backoff.default
-
-    let try_lock ?checked t =
-      let fiber = Fiber.Maybe.current_and_check_if checked in
-      Atomic.get t == Unlocked
-      && Atomic.compare_and_set t Unlocked
-           (if fiber == Fiber.Maybe.nothing then locked_nothing
-            else Locked { fiber; head = []; tail = [] })
 
     let protect ?checked t body =
       let fiber = Fiber.Maybe.current_and_check_if checked in
@@ -2415,11 +2277,8 @@ module Picos_select = struct
       | R Nothing -> ()
       | R (Req r) -> r.unused <- false
 
-    (** This is used to ensure that the [intr_pending] counter is incremented
-      exactly once before the counter is decremented. *)
     let rec incr_once (Req r as req : [ `Req ] tdt) backoff =
       let before = Atomic.get intr_pending in
-      (* [intr_pending] must be read before [r.unused]! *)
       r.unused && before.req != R req
       && begin
            use before.req;
@@ -2431,19 +2290,11 @@ module Picos_select = struct
 
     let intr_action trigger (Req r as req : [ `Req ] tdt) id =
       match Computation.await r.computation with
-      | Cleared ->
-          (* No signal needs to be delivered. *)
-          remove_action trigger r.state id
+      | Cleared -> remove_action trigger r.state id
       | Signaled ->
-          (* Signal was delivered before timeout. *)
           remove_action trigger r.state id;
-          if incr_once req Backoff.default then
-            (* We need to make sure at least one select thread will keep on
-               triggering interrupts. *)
-            wakeup r.state `Alive
+          if incr_once req Backoff.default then wakeup r.state `Alive
       | exception Exit ->
-          (* The timeout was triggered.  This must have been called from the
-             select thread, which will soon trigger an interrupt. *)
           let _ : bool = incr_once req Backoff.default in
           ()
 
@@ -2453,7 +2304,6 @@ module Picos_select = struct
       if Sys.win32 then invalid_arg "not supported on Windows"
       else begin
         let time = to_deadline ~seconds in
-        (* assert (not (Computation.is_running r.computation)); *)
         let state = get () in
         let id = next_id state in
         let (Req r as req : [ `Req ] tdt) =
@@ -2488,8 +2338,6 @@ module Picos_select = struct
           assert (not (List.exists is_intr_sig was_blocked));
           if not (Computation.try_return r.computation Cleared) then begin
             let _ : bool = incr_once req Backoff.default in
-            (* We ensure that the associated increment has been done before we
-               decrement so that the [intr_pending] counter is never too low. *)
             decr Backoff.default
           end
   end
@@ -2505,9 +2353,7 @@ module Picos_select = struct
       config.bits
       land (select_thread_running_on_main_domain_bit lor handle_sigchld_bit)
       = handle_sigchld_bit
-    then
-      (* Ensure there is at least one thread handling [Sys.sigchld] signals. *)
-      get () |> ignore;
+    then get () |> ignore;
     let return = Return { value; computation; alive = true } in
     let id = insert return in
     let remover =
@@ -2515,9 +2361,6 @@ module Picos_select = struct
       @@ fun _trigger id (Return this_r as this) ->
       if this_r.alive then begin
         this_r.alive <- false;
-        (* It should be extremely rare, but possible, that the return was already
-           removed and another added just at this point and so we must account for
-           the possibility and make sure that whatever we remove is completed. *)
         match Picos_htbl.remove_exn chld_awaiters id with
         | Return that_r as that ->
             if this != that then
@@ -2530,45 +2373,16 @@ module Picos_select = struct
 end
 
 module Picos_stdio = struct
-  open Picos
-
   let nonblock_fds =
     Picos_htbl.create ~hashed_type:(module Picos_fd.Resource) ()
 
   module Unix = struct
     include Unix
 
-    type file_descr = Picos_fd.t
-
-    let is_oob flag = MSG_OOB == flag
-    let is_nonblock flag = O_NONBLOCK == flag
-
-    (* The retry wrappers below are written to avoid closure allocations. *)
-
-    (* [EAGAIN] (and [EWOULDBLOCK]) indicates that the operation would have
-       blocked and so we await using the [select] thread for the file descriptor.
-
-       [EINTR] indicates that the operation was interrupted by a signal, which
-       usually shouldn't happen with non-blocking operations.  We don't want to
-       block, so we do the same thing as with [EAGAIN]. *)
-
     let[@inline] intr_req fd =
       if Sys.win32 || Picos_htbl.mem nonblock_fds (Picos_fd.unsafe_get fd) then
         Picos_select.Intr.nothing
-      else Picos_select.Intr.req ~seconds:0.000_01 (* 10μs - TODO *)
-
-    let rec again_0 fd fn op =
-      let intr = intr_req fd in
-      match fn (Picos_fd.unsafe_get fd) with
-      | result ->
-          Picos_select.Intr.clr intr;
-          result
-      | exception Unix.Unix_error ((EAGAIN | EINTR | EWOULDBLOCK), _, _) ->
-          Picos_select.Intr.clr intr;
-          again_0 (Picos_select.await_on fd op) fn op
-      | exception exn ->
-          Picos_select.Intr.clr intr;
-          raise exn
+      else Picos_select.Intr.req ~seconds:0.000_01
 
     let rec again_cloexec_0 ?cloexec fd fn op =
       let intr = intr_req fd in
@@ -2596,36 +2410,6 @@ module Picos_stdio = struct
           Picos_select.Intr.clr intr;
           raise exn
 
-    let rec again_4 fd x1 x2 x3 x4 fn op =
-      let intr = intr_req fd in
-      match fn (Picos_fd.unsafe_get fd) x1 x2 x3 x4 with
-      | result ->
-          Picos_select.Intr.clr intr;
-          result
-      | exception Unix.Unix_error ((EAGAIN | EINTR | EWOULDBLOCK), _, _) ->
-          Picos_select.Intr.clr intr;
-          again_4 (Picos_select.await_on fd op) x1 x2 x3 x4 fn op
-      | exception exn ->
-          Picos_select.Intr.clr intr;
-          raise exn
-
-    let rec again_5 fd x1 x2 x3 x4 x5 fn op =
-      let intr = intr_req fd in
-      match fn (Picos_fd.unsafe_get fd) x1 x2 x3 x4 x5 with
-      | result ->
-          Picos_select.Intr.clr intr;
-          result
-      | exception Unix.Unix_error ((EAGAIN | EINTR | EWOULDBLOCK), _, _) ->
-          Picos_select.Intr.clr intr;
-          again_5 (Picos_select.await_on fd op) x1 x2 x3 x4 x5 fn op
-      | exception exn ->
-          Picos_select.Intr.clr intr;
-          raise exn
-
-    (* [EINPROGRESS] indicates that a socket operation is being performed
-       asynchronously.  We await using the [select] thread for the operation to
-       complete and then get the error from the socket. *)
-
     let progress_1 fd x1 fn op name =
       let intr = intr_req fd in
       match fn (Picos_fd.unsafe_get fd) x1 with
@@ -2633,15 +2417,6 @@ module Picos_stdio = struct
       | exception
           Unix.Unix_error ((EAGAIN | EINPROGRESS | EINTR | EWOULDBLOCK), _, _)
         -> begin
-          (* The documentation of [bind] and [connect] does not mention [EAGAIN]
-             (or [EWOULDBLOCK]), but on Windows we do seem to get those errors
-             from [connect].
-
-             The documentation of [bind] does not mention [EINTR].  Matching on
-             that shouldn't cause issues with [bind].
-
-             For [connect] both [EINPROGRESS] and [EINTR] mean that connection
-             will be established asynchronously and we use [select] to wait. *)
           Picos_select.Intr.clr intr;
           let fd = Picos_select.await_on fd op in
           match Unix.getsockopt_error (Picos_fd.unsafe_get fd) with
@@ -2652,439 +2427,26 @@ module Picos_stdio = struct
           Picos_select.Intr.clr intr;
           raise exn
 
-    let stdin = Picos_fd.create ~dispose:false Unix.stdin
-    and stdout = Picos_fd.create ~dispose:false Unix.stdout
-    and stderr = Picos_fd.create ~dispose:false Unix.stderr
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/open.html *)
-    let openfile path flags file_perm =
-      let fd = Picos_fd.create (Unix.openfile path flags file_perm) in
-      if List.exists is_nonblock flags then begin
-        let if_not_added_fd_has_been_closed_outside =
-          Picos_htbl.try_add nonblock_fds (Picos_fd.unsafe_get fd) ()
-        in
-        assert if_not_added_fd_has_been_closed_outside
-      end;
-      fd
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/close.html *)
     let close fd =
       let _ : bool =
         Picos_htbl.try_remove nonblock_fds (Picos_fd.unsafe_get fd)
       in
       Picos_fd.decr ~close:true fd
 
-    let close_pair (fd1, fd2) =
-      close fd1;
-      close fd2
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/fsync.html *)
-    let fsync fd = again_0 fd Unix.fsync `W
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/read.html *)
     let read fd bytes pos len = again_3 fd bytes pos len Unix.read `R
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html *)
     let write fd bytes pos len = again_3 fd bytes pos len Unix.write `W
 
-    let single_write fd bytes pos len =
-      again_3 fd bytes pos len Unix.single_write `W
-
-    let write_substring fd string pos len =
-      again_3 fd string pos len Unix.write_substring `W
-
-    let single_write_substring fd string pos len =
-      again_3 fd string pos len Unix.single_write_substring `W
-
-    (* *)
-
-    (*let in_channel_of_descr _ = failwith "TODO"*)
-    (*let out_channel_of_descr _ = failwith "TODO"*)
-    (*let descr_of_in_channel _ = failwith "TODO"*)
-    (*let descr_of_out_channel _ = failwith "TODO"*)
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/lseek.html *)
-    let lseek fd amount seek_command =
-      Unix.lseek (Picos_fd.unsafe_get fd) amount seek_command
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/ftruncate.html *)
-    let ftruncate fd size = Unix.ftruncate (Picos_fd.unsafe_get fd) size
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/fstat.html *)
-    let fstat fd = Unix.fstat (Picos_fd.unsafe_get fd)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/isatty.html *)
-    let isatty fd = Unix.isatty (Picos_fd.unsafe_get fd)
-
-    (* *)
-
-    module LargeFile = struct
-      include Unix.LargeFile
-
-      (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/lseek.html *)
-      let lseek fd amount seek_command =
-        Unix.LargeFile.lseek (Picos_fd.unsafe_get fd) amount seek_command
-
-      (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/ftruncate.html *)
-      let ftruncate fd size =
-        Unix.LargeFile.ftruncate (Picos_fd.unsafe_get fd) size
-
-      (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/fstat.html *)
-      let fstat fd = Unix.LargeFile.fstat (Picos_fd.unsafe_get fd)
-    end
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/mmap.html
-
-       This can raise EAGAIN, but it probably should not be handled? *)
-    let map_file fd ?pos kind layout shared dims =
-      Unix.map_file (Picos_fd.unsafe_get fd) ?pos kind layout shared dims
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/fchmod.html *)
-    let fchmod fd file_perm = Unix.fchmod (Picos_fd.unsafe_get fd) file_perm
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/fchown.html *)
-    let fchown fd uid gid = Unix.fchown (Picos_fd.unsafe_get fd) uid gid
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/dup.html *)
-    let dup ?cloexec fd =
-      Picos_fd.create (Unix.dup ?cloexec (Picos_fd.unsafe_get fd))
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/dup.html *)
-    let dup2 ?cloexec src dst =
-      Unix.dup2 ?cloexec (Picos_fd.unsafe_get src) (Picos_fd.unsafe_get dst)
-
-    let set_nonblock fd =
-      Unix.set_nonblock (Picos_fd.unsafe_get fd);
-      Picos_htbl.try_add nonblock_fds (Picos_fd.unsafe_get fd) () |> ignore
-
-    let clear_nonblock fd =
-      Unix.clear_nonblock (Picos_fd.unsafe_get fd);
-      Picos_htbl.try_remove nonblock_fds (Picos_fd.unsafe_get fd) |> ignore
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/fcntl.html *)
-    let set_close_on_exec fd = Unix.set_close_on_exec (Picos_fd.unsafe_get fd)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/fcntl.html *)
-    let clear_close_on_exec fd =
-      Unix.clear_close_on_exec (Picos_fd.unsafe_get fd)
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/pipe.html *)
-    let pipe ?cloexec () =
-      let inn, out = Unix.pipe ?cloexec () in
-      (Picos_fd.create inn, Picos_fd.create out)
-
-    (* *)
-
-    let create_process prog args stdin stdout stderr =
-      Unix.create_process prog args
-        (Picos_fd.unsafe_get stdin)
-        (Picos_fd.unsafe_get stdout)
-        (Picos_fd.unsafe_get stderr)
-
-    let create_process_env prog args env stdin stdout stderr =
-      Unix.create_process_env prog args env
-        (Picos_fd.unsafe_get stdin)
-        (Picos_fd.unsafe_get stdout)
-        (Picos_fd.unsafe_get stderr)
-
-    (*let open_process_in _ = failwith "TODO"*)
-    (*let open_process_out _ = failwith "TODO"*)
-    (*let open_process _ = failwith "TODO"*)
-    (*let open_process_full _ = failwith "TODO"*)
-    (*let open_process_args _ = failwith "TODO"*)
-    (*let open_process_args_in _ = failwith "TODO"*)
-    (*let open_process_args_out _ = failwith "TODO"*)
-    (*let open_process_args_full _ = failwith "TODO"*)
-    (*let process_in_pid _ = failwith "TODO"*)
-    (*let process_out_pid _ = failwith "TODO"*)
-    (*let process_pid _ = failwith "TODO"*)
-    (*let process_full_pid _ = failwith "TODO"*)
-    (*let close_process_in _ = failwith "TODO"*)
-    (*let close_process_out _ = failwith "TODO"*)
-    (*let close_process _ = failwith "TODO"*)
-    (*let close_process_full _ = failwith "TODO"*)
-
-    (* *)
-
-    module Wait_flag = struct
-      let nohang_bit = 0b10
-      let untraced_bit = 0b01
-
-      (* Note that this is optimized to the identity function. *)
-      let to_int = function WNOHANG -> 0 | WUNTRACED -> 1
-      let to_bit flag = nohang_bit - to_int flag
-      let () = assert (to_bit WNOHANG = nohang_bit)
-      let () = assert (to_bit WUNTRACED = untraced_bit)
-
-      let rec to_bits flags bits =
-        match flags with
-        | [] -> bits
-        | flag :: flags -> to_bits flags (bits lor to_bit flag)
-
-      let to_bits flags = to_bits flags 0
-
-      let to_flags =
-        [| []; [ WUNTRACED ]; [ WNOHANG ]; [ WNOHANG; WUNTRACED ] |]
-
-      let to_flags bits = Array.get to_flags bits
-    end
-
-    let rec waitpid_unix ~bits ~pid =
-      if bits land Wait_flag.nohang_bit <> 0 then
-        Unix.waitpid (Wait_flag.to_flags bits) pid
-      else
-        let computation = Computation.create () in
-        Picos_select.return_on_sigchld computation ();
-        match
-          Unix.waitpid (Wait_flag.to_flags (bits lor Wait_flag.nohang_bit)) pid
-        with
-        | exception Unix_error (EINTR, _, _) -> waitpid_unix ~bits ~pid
-        | (pid_or_0, _) as result ->
-            if pid_or_0 = 0 then begin
-              Computation.await computation;
-              waitpid_unix ~bits ~pid
-            end
-            else begin
-              Computation.finish computation;
-              result
-            end
-        | exception exn ->
-            Computation.finish computation;
-            raise exn
-
-    let waitpid_win32 ~bits ~pid =
-      if bits land Wait_flag.nohang_bit <> 0 then
-        Unix.waitpid (Wait_flag.to_flags bits) pid
-      else
-        (* One way to provide a scheduler friendly [waitpid] on Windows would be
-           to use a thread pool to run blocking operations on.  PR for a thread
-           pool implemented in Picos would be welcome! *)
-        invalid_arg "currently not supported on Windows without WNOHANG"
-
-    let waitpid flags pid =
-      let bits = Wait_flag.to_bits flags in
-      if Sys.win32 then
-        if pid <> -1 then waitpid_win32 ~bits ~pid
-        else begin
-          (* This should raise? *)
-          Unix.waitpid flags pid
-        end
-      else waitpid_unix ~bits ~pid
-
-    let wait () =
-      if not Sys.win32 then waitpid_unix ~bits:0 ~pid:(-1)
-      else begin
-        (* This should raise [Invalid_argument] *)
-        Unix.wait ()
-      end
-
-    (* *)
-
-    let sh = "/bin/sh"
-
-    let system cmd =
-      if Sys.win32 then
-        (* One way to provide a scheduler friendly [system] on Windows would be to
-           use a thread pool to run blocking operations on.  PR for a thread pool
-           implemented in Picos would be welcome! *)
-        invalid_arg "currently not supported on Windows"
-      else
-        create_process sh [| sh; "-c"; cmd |] stdin stdout stderr
-        |> waitpid [] |> snd
-
-    (* *)
-
-    let sleepf seconds = Fiber.sleep ~seconds
-    let sleep seconds = Fiber.sleep ~seconds:(Float.of_int seconds)
-
-    (* *)
-
-    exception Done
-
-    let done_bt = Exn_bt.get_callstack 0 Done
-
-    let[@alert "-handler"] select rds wrs exs seconds =
-      let overall = Computation.create () in
-      let canceler =
-        Trigger.from_action overall () @@ fun _ overall _ ->
-        Picos_select.cancel_after overall ~seconds:0.0 done_bt
-      in
-      let prepare op fd =
-        let computation = Computation.create () in
-        if Computation.try_attach computation canceler then
-          Picos_select.return_on computation fd op true;
-        computation
-      in
-      let rdcs = List.map (prepare `R) rds in
-      let wrcs = List.map (prepare `W) wrs in
-      let excs = List.map (prepare `E) exs in
-      let finisher =
-        Trigger.from_action rdcs wrcs @@ fun _ rdcs wrcs ->
-        let return_false computation = Computation.return computation false in
-        List.iter return_false rdcs;
-        List.iter return_false wrcs;
-        List.iter return_false excs
-      in
-      if not (Computation.try_attach overall finisher) then
-        Trigger.signal finisher
-      else if 0.0 <= seconds then
-        Picos_select.cancel_after overall ~seconds done_bt;
-      match Computation.await overall with
-      | () -> assert false
-      | exception Done ->
-          let[@tail_mod_cons] rec zip_filter pred xs ys =
-            match (xs, ys) with
-            | x :: xs, y :: ys ->
-                if pred y then x :: zip_filter pred xs ys
-                else zip_filter pred xs ys
-            | _, _ -> []
-          in
-          ( zip_filter Computation.await rds rdcs,
-            zip_filter Computation.await wrs wrcs,
-            zip_filter Computation.await exs excs )
-      | exception cancelation_exn ->
-          Computation.cancel overall done_bt;
-          raise cancelation_exn
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/lockf.html *)
-    let lockf fd lock_command length =
-      Unix.lockf (Picos_fd.unsafe_get fd) lock_command length
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/socket.html *)
     let socket ?cloexec socket_domain socket_type protocol =
       Picos_fd.create (Unix.socket ?cloexec socket_domain socket_type protocol)
 
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/socketpair.html *)
-    let socketpair ?cloexec socket_domain socket_type mystery =
-      let fst, snd =
-        Unix.socketpair ?cloexec socket_domain socket_type mystery
-      in
-      (Picos_fd.create fst, Picos_fd.create snd)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/accept.html *)
     let accept ?cloexec fd =
       let fd, sockaddr = again_cloexec_0 ?cloexec fd Unix.accept `R in
       (Picos_fd.create fd, sockaddr)
 
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/bind.html *)
     let bind fd sockaddr = progress_1 fd sockaddr Unix.bind `W "bind"
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/connect.html *)
     let connect fd sockaddr = progress_1 fd sockaddr Unix.connect `W "connect"
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/listen.html *)
     let listen fd max_pending = Unix.listen (Picos_fd.unsafe_get fd) max_pending
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/shutdown.html *)
-    let shutdown fd shutdown_command =
-      Unix.shutdown (Picos_fd.unsafe_get fd) shutdown_command
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/getsockname.html *)
     let getsockname fd = Unix.getsockname (Picos_fd.unsafe_get fd)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/getpeername.html *)
-    let getpeername fd = Unix.getpeername (Picos_fd.unsafe_get fd)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/recv.html *)
-    let recv fd bytes offset length flags =
-      again_4 fd bytes offset length flags Unix.recv
-        (if List.exists is_oob flags then `E else `R)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/recvfrom.html *)
-    let recvfrom fd bytes offset length flags =
-      again_4 fd bytes offset length flags Unix.recvfrom
-        (if List.exists is_oob flags then `E else `R)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/send.html *)
-    let send fd bytes offset length flags =
-      again_4 fd bytes offset length flags Unix.send `W
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/send.html *)
-    let send_substring fd string offset length flags =
-      again_4 fd string offset length flags Unix.send_substring `W
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/sendto.html *)
-    let sendto fd bytes offset length flags sockaddr =
-      again_5 fd bytes offset length flags sockaddr Unix.sendto `W
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/sendto.html *)
-    let sendto_substring fd string offset length flags sockaddr =
-      again_5 fd string offset length flags sockaddr Unix.sendto_substring `W
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/getsockopt.html *)
-    let getsockopt fd option = Unix.getsockopt (Picos_fd.unsafe_get fd) option
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/setsockopt.html *)
-    let setsockopt fd option bool =
-      Unix.setsockopt (Picos_fd.unsafe_get fd) option bool
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/getsockopt.html *)
-    let getsockopt_int fd option =
-      Unix.getsockopt_int (Picos_fd.unsafe_get fd) option
-
-    let setsockopt_int fd option int =
-      Unix.setsockopt_int (Picos_fd.unsafe_get fd) option int
-
-    let getsockopt_optint fd option =
-      Unix.getsockopt_optint (Picos_fd.unsafe_get fd) option
-
-    let setsockopt_optint fd option optint =
-      Unix.setsockopt_optint (Picos_fd.unsafe_get fd) option optint
-
-    let getsockopt_float fd option =
-      Unix.getsockopt_float (Picos_fd.unsafe_get fd) option
-
-    let setsockopt_float fd option float =
-      Unix.setsockopt_float (Picos_fd.unsafe_get fd) option float
-
-    let getsockopt_error fd = Unix.getsockopt_error (Picos_fd.unsafe_get fd)
-
-    (* *)
-
-    (*let open_connection _ = failwith "TODO"*)
-    (*let shutdown_connection _ = failwith "TODO"*)
-    (*let establish_server _ = failwith "TODO"*)
-
-    (* *)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/tcgetattr.html *)
-    let tcgetattr fd = Unix.tcgetattr (Picos_fd.unsafe_get fd)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/tcsetattr.html *)
-    let tcsetattr fd setattr_when terminal_io =
-      Unix.tcsetattr (Picos_fd.unsafe_get fd) setattr_when terminal_io
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/tcsendbreak.html *)
-    let tcsendbreak fd duration =
-      Unix.tcsendbreak (Picos_fd.unsafe_get fd) duration
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/tcdrain.html *)
-    let tcdrain fd = Unix.tcdrain (Picos_fd.unsafe_get fd)
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/tcflush.html *)
-    let tcflush fd flush_queue =
-      Unix.tcflush (Picos_fd.unsafe_get fd) flush_queue
-
-    (* https://pubs.opengroup.org/onlinepubs/9699919799/functions/tcflow.html *)
-    let tcflow fd flow_action = Unix.tcflow (Picos_fd.unsafe_get fd) flow_action
   end
 end
 
@@ -3092,8 +2454,6 @@ module Picos_fifos = struct
   open Picos
   module Queue = Picos_mpsc_queue
 
-  (* As a minor optimization, we avoid allocating closures, which take slightly
-     more memory than values of this type. *)
   type ready =
     | Spawn of Fiber.t * (unit -> unit)
     | Continue of Fiber.t * (unit, unit) Effect.Deep.continuation
@@ -3125,11 +2485,7 @@ module Picos_fifos = struct
   let rec next t =
     match Queue.pop_exn t.ready with
     | Spawn (fiber, main) ->
-        let current =
-          (* The current handler must never propagate cancelation, but it would be
-             possible to continue some other fiber and resume the current fiber
-             later. *)
-          Some (fun k -> Effect.Deep.continue k fiber)
+        let current = Some (fun k -> Effect.Deep.continue k fiber)
         and yield =
           Some
             (fun k ->
@@ -3139,13 +2495,8 @@ module Picos_fifos = struct
         let[@alert "-handler"] effc (type a) :
             a Effect.t -> ((a, _) Effect.Deep.continuation -> _) option =
           function
-          | Fiber.Current ->
-              (* We handle [Current] first as it is perhaps the most latency
-                 sensitive effect. *)
-              current
+          | Fiber.Current -> current
           | Fiber.Spawn r ->
-              (* We check cancelation status once and then either perform the
-                 whole operation or discontinue the fiber. *)
               if Fiber.is_canceled fiber then discontinue
               else begin
                 spawn t 0 r.forbid (Packed r.computation) r.mains;
@@ -3153,8 +2504,6 @@ module Picos_fifos = struct
               end
           | Fiber.Yield -> yield
           | Computation.Cancel_after r -> begin
-              (* We check cancelation status once and then either perform the
-                 whole operation or discontinue the fiber. *)
               if Fiber.is_canceled fiber then discontinue
               else
                 match
@@ -3183,9 +2532,6 @@ module Picos_fifos = struct
             Mutex.lock t.mutex;
             match
               if Atomic.get t.needs_wakeup then
-                (* We assume that there is no poll point after the above
-                   [Mutex.lock] and before the below [Condition.wait] is ready to
-                   be woken up by a [Condition.broadcast]. *)
                 Condition.wait t.condition t.mutex
             with
             | () -> Mutex.unlock t.mutex
@@ -3211,16 +2557,8 @@ module Picos_fifos = struct
       next t
     and resume trigger fiber k =
       let resume = Resume (fiber, k) in
-      if Fiber.unsuspend fiber trigger then
-        (* The fiber has not been canceled, so we queue the fiber normally. *)
-        Queue.push t.ready resume
-      else
-        (* The fiber has been canceled, so we give priority to it in this
-           scheduler. *)
-        Queue.push_head t.ready resume;
-      (* As the trigger might have been signaled from another domain or systhread
-         outside of the scheduler, we check whether the scheduler needs to be
-         woken up and take care of it if necessary. *)
+      if Fiber.unsuspend fiber trigger then Queue.push t.ready resume
+      else Queue.push_head t.ready resume;
       if
         Atomic.get t.needs_wakeup
         && Atomic.compare_and_set t.needs_wakeup true false
@@ -3228,12 +2566,7 @@ module Picos_fifos = struct
         begin
           match Mutex.lock t.mutex with
           | () -> Mutex.unlock t.mutex
-          | exception Sys_error _ ->
-              (* This should mean that [resume] was called from a signal handler
-                 running on the scheduler thread.  If the assumption about not
-                 having poll points holds, the [Condition.broadcast] should now be
-                 able to wake up the [Condition.wait] in the scheduler. *)
-              ()
+          | exception Sys_error _ -> ()
         end;
         Condition.broadcast t.condition
       end
@@ -3245,8 +2578,6 @@ module Picos_fifos = struct
     next t;
     Computation.await computation
 end
-
-(* *)
 
 open Picos_structured.Finally
 open Picos_structured
